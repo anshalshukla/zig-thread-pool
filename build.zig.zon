@@ -1,0 +1,8 @@
+.{
+    .name = .thread_pool,
+    .fingerprint = 0x2b20b5087f7ca09b,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.0",
+    .dependencies = .{},
+    .paths = .{""},
+}
