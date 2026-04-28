@@ -1,8 +1,27 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 const Deque = @import("deque.zig").Deque;
 
-pub const WaitGroup = std.Thread.WaitGroup;
+/// Minimal counter-only wait group. `std.Thread.WaitGroup` was removed in
+/// Zig 0.16; we only need start/finish/isDone, so we roll our own with
+/// seq_cst ordering so the Dekker-style park/notify proof in ThreadPool
+/// still closes (see `parked_count` docs).
+pub const WaitGroup = struct {
+    count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    pub fn start(self: *WaitGroup) void {
+        _ = self.count.fetchAdd(1, .seq_cst);
+    }
+
+    pub fn finish(self: *WaitGroup) void {
+        _ = self.count.fetchSub(1, .seq_cst);
+    }
+
+    pub fn isDone(self: *WaitGroup) bool {
+        return self.count.load(.seq_cst) == 0;
+    }
+};
 
 pub const Error = error{
     InvalidThreadCount,
@@ -58,24 +77,54 @@ pub const ThreadPool = struct {
     /// low bits count in-flight ThreadPool calls that must drain before free.
     call_state: std.atomic.Value(u64),
     global_queue: GlobalQueue,
-    park_mutex: std.Thread.Mutex,
-    park_cond: std.Thread.Condition,
-    lifecycle_mutex: std.Thread.Mutex,
-    lifecycle_cond: std.Thread.Condition,
-    /// Monotonically increasing counter bumped on every schedule. Workers snapshot
-    /// this before scanning for work and compare under park_mutex before sleeping,
-    /// ensuring no signal is missed between "no work found" and wait().
-    work_counter: std.atomic.Value(u64),
-    /// Number of threads currently parked on park_cond. Notifiers skip the
-    /// lock+broadcast when zero. Correctness rests on a Dekker-style proof:
-    /// waiters inc this BEFORE checking their predicate, notifiers mutate the
-    /// predicate BEFORE reading this, both with seq_cst — any execution where
-    /// a waiter parks AND a notifier skips would close a four-event cycle.
+    lifecycle_mutex: Io.Mutex,
+    lifecycle_cond: Io.Condition,
+    /// Monotonically increasing counter bumped on every schedule completion
+    /// or other wakeable event. Workers snapshot this before scanning for
+    /// work and compare via futex before sleeping; notifiers bump it then
+    /// `futexWake`. u32 because `Io.futexWait*` is 4-byte-only — wraparound
+    /// every 2^32 events is bounded only by missed wakeups, and waiters all
+    /// have a `park_timeout_ns` ceiling, so wraparound at most adds one
+    /// timeout-bounded delay before progress resumes.
+    work_counter: std.atomic.Value(u32),
+    /// Number of threads currently parked in `futexWaitTimeout` on
+    /// `work_counter`. Notifiers skip `futexWake` when zero. Correctness
+    /// rests on two seq_cst edges that together rule out missed wakeups:
+    ///
+    /// Waiter ordering (every wait path): snapshot `work_counter` → scan
+    /// for work / spin → seq_cst `fetchAdd(parked_count)` → seq_cst
+    /// re-check predicate (`wg.isDone` / `s.pending` / `done` / shutdown)
+    /// → `futexWaitTimeout(work_counter, snapshot)`.
+    ///
+    /// Notifier ordering (`maybeWakeWaiters`): predicate mutation (e.g.
+    /// `wg.finish`, `pending.fetchSub`, `done.store`) → seq_cst
+    /// `fetchAdd(work_counter)` → seq_cst `load(parked_count)` → wake.
+    ///
+    /// Edge 1 (`work_counter` snapshot vs notifier `fetchAdd`): if the
+    /// notifier bumps between the waiter's snapshot and its syscall,
+    /// `futexWaitTimeout` returns `EAGAIN` immediately because the
+    /// observed value no longer matches the snapshot.
+    ///
+    /// Edge 2 (Dekker pair on `parked_count` and the predicate): if the
+    /// notifier's bump happens after the waiter's snapshot AND it skips
+    /// the wake because it observed `parked_count == 0`, then by seq_cst
+    /// total order the waiter's predicate re-check is sequenced after
+    /// the notifier's predicate mutation and observes the wakeup
+    /// condition — so the waiter does not park. Any execution where a
+    /// waiter parks AND a notifier skips would close a four-event cycle.
+    ///
+    /// Editing note: do not move the `parked_count` inc earlier than the
+    /// `work_counter` snapshot, and do not drop the early snapshot — both
+    /// edges are load-bearing.
     parked_count: std.atomic.Value(u32),
     /// Effectively immutable after `init`. The field is left non-const only
     /// to support failure-injection tests; production code must not mutate.
     /// Invoked from arbitrary threads — must be thread-safe (see doc comment).
     allocator: Allocator,
+    /// Used for thread parking (`futexWaitTimeout`/`futexWake` on
+    /// `work_counter`), the lifecycle Mutex/Condition, and `Thread.setName`.
+    /// Must outlive the pool.
+    io: Io,
     thread_count: u32,
 
     /// Upper bound on caller-supplied thread count. Guards against resource
@@ -89,13 +138,13 @@ pub const ThreadPool = struct {
     const call_state_count_mask: u64 = call_state_closed_mask - 1;
 
     const GlobalQueue = struct {
-        mutex: std.Thread.Mutex = .{},
+        mutex: Io.Mutex = .init,
         head: ?*Task = null,
         tail: ?*Task = null,
 
-        fn push(self: *GlobalQueue, task: *Task) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+        fn push(self: *GlobalQueue, io: Io, task: *Task) void {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
             task.next = null;
             if (self.tail) |tail| {
                 tail.next = task;
@@ -105,9 +154,9 @@ pub const ThreadPool = struct {
             self.tail = task;
         }
 
-        fn pop(self: *GlobalQueue) ?*Task {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+        fn pop(self: *GlobalQueue, io: Io) ?*Task {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
             const task = self.head orelse return null;
             self.head = task.next;
             if (self.head == null) {
@@ -117,17 +166,17 @@ pub const ThreadPool = struct {
             return task;
         }
 
-        fn isEmpty(self: *GlobalQueue) bool {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+        fn isEmpty(self: *GlobalQueue, io: Io) bool {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
             return self.head == null;
         }
 
         /// O(n). Diagnostic only — used by `deinit`'s pending-tasks panic so
         /// the operator sees the actual leftover count rather than a boolean.
-        fn len(self: *GlobalQueue) usize {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+        fn len(self: *GlobalQueue, io: Io) usize {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
             var n: usize = 0;
             var cur = self.head;
             while (cur) |t| : (cur = t.next) n += 1;
@@ -137,8 +186,20 @@ pub const ThreadPool = struct {
 
     pub const Config = struct {
         allocator: Allocator,
+        /// Used for thread parking and `setName`. Typically obtained from
+        /// `std.Io.Threaded.io()`. Must remain valid for the pool's lifetime.
+        io: Io,
         thread_count: ?u32 = null,
     };
+
+    /// Parking timeout expressed as `Io.Timeout`. Built from `park_timeout_ns`
+    /// against the boot clock, which is monotonic on every supported target.
+    fn parkTimeout() Io.Timeout {
+        return .{ .duration = .{
+            .raw = Io.Duration.fromNanoseconds(park_timeout_ns),
+            .clock = .boot,
+        } };
+    }
 
     /// Create a new thread pool. The returned pointer is heap-allocated and stable
     /// (workers hold back-pointers to it).
@@ -190,13 +251,12 @@ pub const ThreadPool = struct {
             .shutdown = std.atomic.Value(bool).init(false),
             .call_state = std.atomic.Value(u64).init(0),
             .global_queue = .{},
-            .park_mutex = .{},
-            .park_cond = .{},
-            .lifecycle_mutex = .{},
-            .lifecycle_cond = .{},
-            .work_counter = std.atomic.Value(u64).init(0),
+            .lifecycle_mutex = .init,
+            .lifecycle_cond = .init,
+            .work_counter = std.atomic.Value(u32).init(0),
             .parked_count = std.atomic.Value(u32).init(0),
             .allocator = config.allocator,
+            .io = config.io,
             .thread_count = thread_count,
         };
 
@@ -209,9 +269,10 @@ pub const ThreadPool = struct {
         var spawned: u32 = 0;
         errdefer {
             pool.shutdown.store(true, .release);
-            pool.park_mutex.lock();
-            pool.park_cond.broadcast();
-            pool.park_mutex.unlock();
+            // Wake any worker that already parked in `futexWaitTimeout` so it
+            // can observe `shutdown` and exit before we join.
+            _ = pool.work_counter.fetchAdd(1, .seq_cst);
+            pool.io.futexWake(u32, &pool.work_counter.raw, std.math.maxInt(u32));
             for (0..spawned) |j| {
                 pool.threads[j].join();
             }
@@ -229,7 +290,7 @@ pub const ThreadPool = struct {
             // reasons. Both failures are benign — threads run regardless.
             var name_buf: [std.Thread.max_name_len]u8 = undefined;
             const name = std.fmt.bufPrint(&name_buf, "pool-worker-{d}", .{w.index}) catch continue;
-            t.setName(name) catch {};
+            t.setName(pool.io, name) catch {};
         }
 
         return pool;
@@ -249,16 +310,17 @@ pub const ThreadPool = struct {
             @panic("ThreadPool.deinit called more than once");
         }
 
-        self.lifecycle_mutex.lock();
+        self.lifecycle_mutex.lockUncancelable(self.io);
         while ((self.call_state.load(.acquire) & call_state_count_mask) != 0) {
-            self.lifecycle_cond.wait(&self.lifecycle_mutex);
+            self.lifecycle_cond.waitUncancelable(self.io, &self.lifecycle_mutex);
         }
-        self.lifecycle_mutex.unlock();
+        self.lifecycle_mutex.unlock(self.io);
 
         self.shutdown.store(true, .release);
-        self.park_mutex.lock();
-        self.park_cond.broadcast();
-        self.park_mutex.unlock();
+        // Wake every parked worker/waiter via the same futex they sleep on,
+        // so they can observe `shutdown` and exit promptly.
+        _ = self.work_counter.fetchAdd(1, .seq_cst);
+        self.io.futexWake(u32, &self.work_counter.raw, std.math.maxInt(u32));
         for (self.threads) |t| {
             t.join();
         }
@@ -281,7 +343,7 @@ pub const ThreadPool = struct {
             }
             deque_pending += raw_size;
         }
-        const global_pending = self.global_queue.len();
+        const global_pending = self.global_queue.len(self.io);
         if (deque_pending + global_pending > 0) {
             @panic("ThreadPool.deinit called with pending tasks — wait for all spawned work before deinit");
         }
@@ -345,15 +407,10 @@ pub const ThreadPool = struct {
                 @call(.auto, func, wrapper.args);
                 alloc.destroy(wrapper);
                 wg_ptr.finish();
-                // Unconditionally broadcast rather than using the parked_count
-                // gate: WaitGroup's internal ordering isn't seq_cst, so the
-                // Dekker pair (inc parked_count / load isDone) doesn't close a
-                // cycle with finish's release. Hot under high spawn rates —
-                // if this becomes a bottleneck, strengthen WaitGroup's ordering
-                // and switch to maybeWakeWaiters.
-                pool.park_mutex.lock();
-                pool.park_cond.broadcast();
-                pool.park_mutex.unlock();
+                // `WaitGroup` uses seq_cst internally so the Dekker pair (inc
+                // parked_count / load isDone) closes against finish's
+                // fetchSub — safe to gate the wake on parked_count.
+                pool.maybeWakeWaiters();
             }
         };
 
@@ -371,6 +428,11 @@ pub const ThreadPool = struct {
 
         var idle_spins: u32 = 0;
         while (!wg.isDone()) {
+            // Snapshot work_counter BEFORE scanning so any notifier that
+            // bumps it during the scan/spin/post-park-inc window makes the
+            // futex syscall return EAGAIN immediately. See parked_count
+            // docstring for the Dekker pair on the predicate re-check.
+            const snapshot = self.work_counter.load(.seq_cst);
             if (self.findAndRunTask()) {
                 idle_spins = 0;
                 continue;
@@ -380,20 +442,11 @@ pub const ThreadPool = struct {
                 std.atomic.spinLoopHint();
                 continue;
             }
-            // Park with a short timeout: completions broadcast, and the timeout
-            // bounds latency for waiters that race with a park transition.
-            const snapshot = self.work_counter.load(.acquire);
-            self.park_mutex.lock();
-            // Inc parked_count BEFORE checking the predicate (see parked_count
-            // docstring for the proof). wg's internal ordering is acquire/release
-            // not seq_cst, so the parked_count gate doesn't apply to wg.finish's
-            // broadcast — but wg's wrapper.run still always broadcasts.
             _ = self.parked_count.fetchAdd(1, .seq_cst);
-            if (!wg.isDone() and self.work_counter.load(.seq_cst) == snapshot) {
-                self.park_cond.timedWait(&self.park_mutex, park_timeout_ns) catch {};
+            if (!wg.isDone()) {
+                self.io.futexWaitTimeout(u32, &self.work_counter.raw, snapshot, parkTimeout()) catch {};
             }
             _ = self.parked_count.fetchSub(1, .seq_cst);
-            self.park_mutex.unlock();
             idle_spins = 0;
         }
     }
@@ -486,6 +539,7 @@ pub const ThreadPool = struct {
     fn scopeWait(self: *Self, s: *Scope) void {
         var idle_spins: u32 = 0;
         while (s.pending.load(.seq_cst) > 0) {
+            const snapshot = self.work_counter.load(.seq_cst);
             if (self.findAndRunTask()) {
                 idle_spins = 0;
                 continue;
@@ -495,14 +549,11 @@ pub const ThreadPool = struct {
                 std.atomic.spinLoopHint();
                 continue;
             }
-            const snapshot = self.work_counter.load(.acquire);
-            self.park_mutex.lock();
             _ = self.parked_count.fetchAdd(1, .seq_cst);
-            if (s.pending.load(.seq_cst) > 0 and self.work_counter.load(.seq_cst) == snapshot) {
-                self.park_cond.timedWait(&self.park_mutex, park_timeout_ns) catch {};
+            if (s.pending.load(.seq_cst) > 0) {
+                self.io.futexWaitTimeout(u32, &self.work_counter.raw, snapshot, parkTimeout()) catch {};
             }
             _ = self.parked_count.fetchSub(1, .seq_cst);
-            self.park_mutex.unlock();
             idle_spins = 0;
         }
     }
@@ -575,7 +626,7 @@ pub const ThreadPool = struct {
                 // Local deque full — publish globally so a worker can pick B up.
                 // We can no longer reclaim from the owner deque, but fork-join
                 // parallelism is preserved.
-                self.global_queue.push(&jt.task);
+                self.global_queue.push(self.io, &jt.task);
                 reclaimable = false;
             };
             self.notifyWorker();
@@ -603,7 +654,7 @@ pub const ThreadPool = struct {
             // Caller isn't a worker. Push B globally so workers execute it in
             // parallel with A on the caller's thread — never fall back to
             // sequential; the API promises parallelism.
-            self.global_queue.push(&jt.task);
+            self.global_queue.push(self.io, &jt.task);
             self.notifyWorker();
 
             const a_result = @call(.auto, a_fn, a_args);
@@ -616,6 +667,7 @@ pub const ThreadPool = struct {
     fn waitForJoin(self: *Self, done: *std.atomic.Value(bool)) void {
         var idle_spins: u32 = 0;
         while (!done.load(.seq_cst)) {
+            const snapshot = self.work_counter.load(.seq_cst);
             if (self.findAndRunTask()) {
                 idle_spins = 0;
                 continue;
@@ -625,14 +677,11 @@ pub const ThreadPool = struct {
                 std.atomic.spinLoopHint();
                 continue;
             }
-            const snapshot = self.work_counter.load(.acquire);
-            self.park_mutex.lock();
             _ = self.parked_count.fetchAdd(1, .seq_cst);
-            if (!done.load(.seq_cst) and self.work_counter.load(.seq_cst) == snapshot) {
-                self.park_cond.timedWait(&self.park_mutex, park_timeout_ns) catch {};
+            if (!done.load(.seq_cst)) {
+                self.io.futexWaitTimeout(u32, &self.work_counter.raw, snapshot, parkTimeout()) catch {};
             }
             _ = self.parked_count.fetchSub(1, .seq_cst);
-            self.park_mutex.unlock();
             idle_spins = 0;
         }
     }
@@ -675,9 +724,9 @@ pub const ThreadPool = struct {
         if ((previous_state & call_state_closed_mask) != 0 and
             (previous_state & call_state_count_mask) == 1)
         {
-            self.lifecycle_mutex.lock();
-            self.lifecycle_cond.broadcast();
-            self.lifecycle_mutex.unlock();
+            self.lifecycle_mutex.lockUncancelable(self.io);
+            self.lifecycle_cond.broadcast(self.io);
+            self.lifecycle_mutex.unlock(self.io);
         }
     }
 
@@ -693,31 +742,34 @@ pub const ThreadPool = struct {
         }
         if (self.localWorker()) |worker| {
             worker.deque.push(task) catch {
-                self.global_queue.push(task);
+                self.global_queue.push(self.io, task);
                 self.notifyWorker();
                 return;
             };
             self.notifyWorker();
             return;
         }
-        self.global_queue.push(task);
+        self.global_queue.push(self.io, task);
         self.notifyWorker();
     }
 
     fn notifyWorker(self: *Self) void {
-        _ = self.work_counter.fetchAdd(1, .seq_cst);
         self.maybeWakeWaiters();
     }
 
-    /// Broadcast on park_cond only when at least one thread is parked. The
-    /// proof requires seq_cst on parked_count and on the predicate every
-    /// caller pairs us with (work_counter for notifyWorker, jt.done for
-    /// JoinTask.run, scope.pending for Scope wrapper).
+    /// Bump `work_counter` so that any pending `futexWaitTimeout` whose
+    /// snapshot matched the prior value either returns `EAGAIN` immediately
+    /// or, if already sleeping, wakes via `futexWake` below. The seq_cst
+    /// fetchAdd is the publish edge that pairs with the waiter's seq_cst
+    /// snapshot/predicate read. The `parked_count` gate skips the syscall
+    /// when no thread is sleeping; the proof requires seq_cst on both the
+    /// gate and on the predicate every caller pairs us with (jt.done for
+    /// `JoinTask.run`, scope.pending for `Scope` wrapper, wg.count for
+    /// `spawnWg` wrapper, work_counter itself for `notifyWorker`).
     fn maybeWakeWaiters(self: *Self) void {
+        _ = self.work_counter.fetchAdd(1, .seq_cst);
         if (self.parked_count.load(.seq_cst) > 0) {
-            self.park_mutex.lock();
-            self.park_cond.broadcast();
-            self.park_mutex.unlock();
+            self.io.futexWake(u32, &self.work_counter.raw, std.math.maxInt(u32));
         }
     }
 
@@ -729,7 +781,7 @@ pub const ThreadPool = struct {
                 return true;
             }
         }
-        if (self.global_queue.pop()) |task| {
+        if (self.global_queue.pop(self.io)) |task| {
             task.callback(task);
             return true;
         }
@@ -793,7 +845,7 @@ pub const ThreadPool = struct {
 
             // Snapshot work_counter before scanning — if it changes by the time
             // we consider parking, new work was posted and we must re-scan.
-            const snapshot = pool.work_counter.load(.acquire);
+            const snapshot = pool.work_counter.load(.seq_cst);
 
             if (worker.deque.pop()) |task| {
                 idle_spins = 0;
@@ -801,7 +853,7 @@ pub const ThreadPool = struct {
                 continue;
             }
 
-            if (pool.global_queue.pop()) |task| {
+            if (pool.global_queue.pop(pool.io)) |task| {
                 idle_spins = 0;
                 task.callback(task);
                 continue;
@@ -821,20 +873,16 @@ pub const ThreadPool = struct {
             if (idle_spins < 64) {
                 std.atomic.spinLoopHint();
             } else {
-                pool.park_mutex.lock();
-                if (pool.shutdown.load(.acquire)) {
-                    pool.park_mutex.unlock();
-                    return;
-                }
-                // Inc parked_count BEFORE the work_counter check so that any
-                // notifier that mutates work_counter after our load observes
-                // parked_count > 0 and broadcasts. See parked_count docstring.
+                if (pool.shutdown.load(.acquire)) return;
+                // Inc parked_count BEFORE the futex syscall so that any
+                // notifier that bumps work_counter after our snapshot
+                // observes parked_count > 0 and wakes us. See parked_count
+                // docstring. futexWaitTimeout itself re-checks
+                // `work_counter == snapshot` before sleeping, so a bump
+                // between snapshot and the syscall returns immediately.
                 _ = pool.parked_count.fetchAdd(1, .seq_cst);
-                if (pool.work_counter.load(.seq_cst) == snapshot) {
-                    pool.park_cond.timedWait(&pool.park_mutex, park_timeout_ns) catch {};
-                }
+                pool.io.futexWaitTimeout(u32, &pool.work_counter.raw, snapshot, parkTimeout()) catch {};
                 _ = pool.parked_count.fetchSub(1, .seq_cst);
-                pool.park_mutex.unlock();
                 idle_spins = 0;
             }
         }
@@ -845,9 +893,21 @@ pub const ThreadPool = struct {
 // Tests
 // =============================================================================
 
+/// Per-test Io provider. `Threaded.init` installs SIGIO/SIGPIPE handlers
+/// (restored on `deinit`) and reads `getCpuCount`, but does no allocations
+/// against the supplied allocator on the success path we exercise — safe
+/// to run alongside `std.testing.allocator`'s leak checker.
+fn testThreaded() Io.Threaded {
+    return Io.Threaded.init(std.testing.allocator, .{});
+}
+
 test "pool init and deinit" {
+    var threaded = testThreaded();
+    defer threaded.deinit();
+
     const pool = try ThreadPool.init(.{
         .allocator = std.testing.allocator,
+        .io = threaded.io(),
         .thread_count = 2,
     });
     defer pool.deinit();
@@ -856,22 +916,34 @@ test "pool init and deinit" {
 }
 
 test "init rejects zero thread count" {
+    var threaded = testThreaded();
+    defer threaded.deinit();
+
     try std.testing.expectError(error.InvalidThreadCount, ThreadPool.init(.{
         .allocator = std.testing.allocator,
+        .io = threaded.io(),
         .thread_count = 0,
     }));
 }
 
 test "init rejects oversized thread count" {
+    var threaded = testThreaded();
+    defer threaded.deinit();
+
     try std.testing.expectError(error.ThreadCountTooLarge, ThreadPool.init(.{
         .allocator = std.testing.allocator,
+        .io = threaded.io(),
         .thread_count = ThreadPool.max_thread_count + 1,
     }));
 }
 
 test "spawnWg basic" {
+    var threaded = testThreaded();
+    defer threaded.deinit();
+
     const pool = try ThreadPool.init(.{
         .allocator = std.testing.allocator,
+        .io = threaded.io(),
         .thread_count = 2,
     });
     defer pool.deinit();
@@ -892,8 +964,12 @@ test "spawnWg basic" {
 }
 
 test "scope basic" {
+    var threaded = testThreaded();
+    defer threaded.deinit();
+
     const pool = try ThreadPool.init(.{
         .allocator = std.testing.allocator,
+        .io = threaded.io(),
         .thread_count = 4,
     });
     defer pool.deinit();
@@ -916,8 +992,12 @@ test "scope basic" {
 }
 
 test "scope propagates user function errors" {
+    var threaded = testThreaded();
+    defer threaded.deinit();
+
     const pool = try ThreadPool.init(.{
         .allocator = std.testing.allocator,
+        .io = threaded.io(),
         .thread_count = 2,
     });
     defer pool.deinit();
@@ -932,8 +1012,12 @@ test "scope propagates user function errors" {
 }
 
 test "join basic" {
+    var threaded = testThreaded();
+    defer threaded.deinit();
+
     const pool = try ThreadPool.init(.{
         .allocator = std.testing.allocator,
+        .io = threaded.io(),
         .thread_count = 2,
     });
     defer pool.deinit();
@@ -969,8 +1053,12 @@ test "join basic" {
 }
 
 test "join from non-worker forks via global queue" {
+    var threaded = testThreaded();
+    defer threaded.deinit();
+
     const pool = try ThreadPool.init(.{
         .allocator = std.testing.allocator,
+        .io = threaded.io(),
         .thread_count = 2,
     });
     defer pool.deinit();
@@ -995,8 +1083,12 @@ test "join from non-worker forks via global queue" {
 }
 
 test "scope stress test" {
+    var threaded = testThreaded();
+    defer threaded.deinit();
+
     const pool = try ThreadPool.init(.{
         .allocator = std.testing.allocator,
+        .io = threaded.io(),
         .thread_count = 4,
     });
     defer pool.deinit();
@@ -1019,8 +1111,12 @@ test "scope stress test" {
 }
 
 test "spawnWg propagates allocator errors" {
+    var threaded = testThreaded();
+    defer threaded.deinit();
+
     const pool = try ThreadPool.init(.{
         .allocator = std.testing.allocator,
+        .io = threaded.io(),
         .thread_count = 2,
     });
     defer pool.deinit();
@@ -1042,8 +1138,12 @@ test "spawnWg propagates allocator errors" {
 }
 
 test "waitAndWork steals worker-local tasks for external callers" {
+    var threaded = testThreaded();
+    defer threaded.deinit();
+
     const pool = try ThreadPool.init(.{
         .allocator = std.testing.allocator,
+        .io = threaded.io(),
         .thread_count = 1,
     });
     defer pool.deinit();
@@ -1093,15 +1193,19 @@ test "waitAndWork steals worker-local tasks for external callers" {
             ran_before_release = true;
             break;
         }
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        threaded.io().sleep(.fromNanoseconds(1 * std.time.ns_per_ms), .awake) catch {};
     }
 
     try std.testing.expect(ran_before_release);
 }
 
 test "deinit waits for in-flight join callers" {
+    var threaded = testThreaded();
+    defer threaded.deinit();
+
     const pool = try ThreadPool.init(.{
         .allocator = std.testing.allocator,
+        .io = threaded.io(),
         .thread_count = 2,
     });
 
@@ -1120,13 +1224,13 @@ test "deinit waits for in-flight join callers" {
         ) void {
             const result = p.join(
                 struct {
-                    fn a(flag: *std.atomic.Value(bool)) u64 {
+                    fn a(flag: *std.atomic.Value(bool), inner_p: *ThreadPool) u64 {
                         flag.store(true, .release);
-                        std.Thread.sleep(20 * std.time.ns_per_ms);
+                        inner_p.io.sleep(.fromNanoseconds(20 * std.time.ns_per_ms), .awake) catch {};
                         return 7;
                     }
                 }.a,
-                .{started},
+                .{ started, p },
                 struct {
                     fn b() u64 {
                         return 11;
